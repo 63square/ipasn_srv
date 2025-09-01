@@ -1,31 +1,31 @@
-use axum::extract::State;
-use axum::routing::post;
-use axum::{Router, extract::Json};
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
-use serde::{Deserialize, Serialize};
+use prost::Message;
 use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use tokio::io;
 
-// -- FORMAT --
-// network,country,country_code,continent,continent_code,asn,as_name,as_domain
-// 1.0.0.0/24,Australia,AU,Oceania,OC,AS13335,"Cloudflare, Inc.",cloudflare.com
+mod protos {
+    include!("protos/_.rs");
+}
 
-type Record = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
+type Record = (String, String, String, String, String, String, String);
 
-type Table = IpnetTrie<Record>;
+type Table = IpnetTrie<protos::IpRecord>;
+
+fn record_convert(record: Record) -> protos::IpRecord {
+    protos::IpRecord {
+        network: record.0,
+        country: record.1,
+        country_code: record.2,
+        continent: record.3,
+        asn: record.4,
+        as_name: record.5,
+        as_domain: record.6,
+    }
+}
 
 fn load_data(data_path: &str) -> Table {
     let mut asn_table: Table = IpnetTrie::new();
@@ -36,12 +36,12 @@ fn load_data(data_path: &str) -> Table {
         let mut record: Record = result.expect("unable to read record");
 
         if let Ok(network) = IpNet::from_str(&record.0) {
-            asn_table.insert(network, record);
+            asn_table.insert(network, record_convert(record));
         } else {
             record.0.push_str("/32");
 
             if let Ok(network) = IpNet::from_str(&record.0) {
-                asn_table.insert(network, record);
+                asn_table.insert(network, record_convert(record));
             } else {
                 panic!("Invalid network {}", record.0)
             }
@@ -51,45 +51,52 @@ fn load_data(data_path: &str) -> Table {
     asn_table
 }
 
-#[derive(Deserialize)]
-struct IpRequest {
-    ips: Vec<String>,
-}
-
-type IpResults = HashMap<String, Option<Record>>;
-
-async fn handle_bulk_lookup(
-    State(state): State<Arc<Table>>,
-    Json(payload): Json<IpRequest>,
-) -> Json<IpResults> {
-    let mut results = IpResults::with_capacity(payload.ips.len());
-
-    for ip_str in payload.ips {
-        if let Ok(ip) = IpAddr::from_str(&ip_str) {
-            if let Some(result) = state.longest_match(&IpNet::from(ip)) {
-                results.insert(ip_str, Some(result.1.clone()));
-            } else {
-                results.insert(ip_str, None);
-            }
-        } else {
-            results.insert(ip_str, None);
-        }
-    }
-
-    Json(results)
-}
-
 #[tokio::main]
-async fn main() {
+async fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 2, "Usage: ./server <data.csv>");
 
     let table = load_data(&args[1]);
 
-    let app = Router::new()
-        .route("/", post(handle_bulk_lookup))
-        .with_state(table.into());
+    println!("Data loaded successfully");
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:8080").await?;
+    let mut buf = [0; 1024];
+
+    println!("Listening for requests");
+
+    loop {
+        let (len, addr) = sock.recv_from(&mut buf).await?;
+
+        let mut response: protos::IpLookupResponse = protos::IpLookupResponse {
+            results: HashMap::new(),
+        };
+
+        if let Ok(request) = protos::IpLookupRequest::decode(&buf[..]) {
+            for ip in request.ips {
+                if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
+                    let network = IpNet::from(parsed_ip);
+                    if let Some(found) = table.longest_match(&network) {
+                        response.results.insert(
+                            ip,
+                            protos::IpResult {
+                                record: Some(found.1.clone()),
+                            },
+                        );
+                    } else {
+                        response
+                            .results
+                            .insert(ip, protos::IpResult { record: None });
+                    }
+                } else {
+                    response
+                        .results
+                        .insert(ip, protos::IpResult { record: None });
+                }
+            }
+        }
+
+        let response = response.encode_to_vec();
+        let _ = sock.send_to(&response, addr).await?;
+    }
 }

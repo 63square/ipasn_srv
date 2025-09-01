@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+message IpLookupRequest {
+  repeated string ips = 1;
+}
+
+message IpLookupResponse {
+  map<string, IpResult> results = 1;
+}
+
+message IpResult {
+  optional IpRecord record = 1;
+}
+
+message IpRecord {
+  string network = 1;
+  string country = 2;
+  string country_code = 3;
+  string continent = 4;
+  string asn = 5;
+  string as_name = 6;
+  string as_domain = 7;
+}
