@@ -60,8 +60,8 @@ async fn main() -> io::Result<()> {
 
     println!("Data loaded successfully");
 
-    let sock = tokio::net::UdpSocket::bind("0.0.0.0:8080").await?;
-    let mut buf = [0; 1024];
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:36841").await?;
+    let mut buf = [0u8; 65535];
 
     println!("Listening for requests");
 
@@ -72,7 +72,7 @@ async fn main() -> io::Result<()> {
             results: HashMap::new(),
         };
 
-        if let Ok(request) = protos::IpLookupRequest::decode(&buf[..]) {
+        if let Ok(request) = protos::IpLookupRequest::decode(&buf[..len]) {
             for ip in request.ips {
                 if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
                     let network = IpNet::from(parsed_ip);
