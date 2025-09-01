@@ -1,74 +1,52 @@
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Router, extract::Json};
-use ipnet::{IpNet, IpSub, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
-type ASNRecord = (IpAddr, IpAddr, u32, String);
-type CountryRecord = (IpAddr, IpAddr, String);
+// -- FORMAT --
+// network,country,country_code,continent,continent_code,asn,as_name,as_domain
+// 1.0.0.0/24,Australia,AU,Oceania,OC,AS13335,"Cloudflare, Inc.",cloudflare.com
 
-type ASNWithCountry = (u32, String, String);
+type Record = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
-fn parse_network(ip_from: IpAddr, ip_to: IpAddr) -> Option<IpNet> {
-    match (ip_from, ip_to) {
-        (IpAddr::V4(start), IpAddr::V4(end)) => {
-            let diff = end.saturating_sub(start);
-            let leading_zeros = diff.leading_zeros() as u8;
+type Table = IpnetTrie<Record>;
 
-            Some(IpNet::V4(Ipv4Net::new(start, leading_zeros).unwrap()))
-        }
-        (IpAddr::V6(start), IpAddr::V6(end)) => {
-            let diff = end.saturating_sub(start);
-            let leading_zeros = diff.leading_zeros() as u8;
+fn load_data(data_path: &str) -> Table {
+    let mut asn_table: Table = IpnetTrie::new();
 
-            Some(IpNet::V6(Ipv6Net::new(start, leading_zeros).unwrap()))
-        }
-        _ => None,
-    }
-}
+    let mut data_reader = csv::Reader::from_path(data_path).expect("unable to read data");
 
-type ASNTable = IpnetTrie<ASNWithCountry>;
-fn load_data(asn_path: &str, country_path: &str) -> ASNTable {
-    let mut asn_table: ASNTable = IpnetTrie::new();
-    let mut country_table: IpnetTrie<CountryRecord> = IpnetTrie::new();
+    for result in data_reader.deserialize() {
+        let mut record: Record = result.expect("unable to read record");
 
-    let mut asn_data_reader = csv::Reader::from_path(asn_path).expect("unable to read asn data");
-    let mut country_data_reader =
-        csv::Reader::from_path(country_path).expect("unable to read country data");
-
-    for result in country_data_reader.deserialize() {
-        let record: CountryRecord = result.expect("unable to read country record");
-
-        let ip_from: IpAddr = record.0;
-        let ip_to: IpAddr = record.1;
-
-        let network = parse_network(ip_from, ip_to).unwrap();
-
-        country_table.insert(network, record);
-    }
-
-    let mut skipped = 0;
-    for result in asn_data_reader.deserialize() {
-        let record: ASNRecord = result.expect("unable to read ASN record");
-
-        let ip_from: IpAddr = record.0;
-        let ip_to: IpAddr = record.1;
-
-        let network = parse_network(ip_from, ip_to).unwrap();
-
-        if let Some(found) = &country_table.longest_match(&network) {
-            asn_table.insert(network, (record.2, record.3, found.1.2.clone()));
+        if let Ok(network) = IpNet::from_str(&record.0) {
+            asn_table.insert(network, record);
         } else {
-            skipped += 1
+            record.0.push_str("/32");
+
+            if let Ok(network) = IpNet::from_str(&record.0) {
+                asn_table.insert(network, record);
+            } else {
+                panic!("Invalid network {}", record.0)
+            }
         }
     }
-
-    println!("Loaded data, skipped {}", skipped);
 
     asn_table
 }
@@ -78,36 +56,23 @@ struct IpRequest {
     ips: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct IpResult {
-    ip: String,
-    result: Option<ASNWithCountry>,
-}
+type IpResults = HashMap<String, Option<Record>>;
 
 async fn handle_bulk_lookup(
-    State(state): State<Arc<ASNTable>>,
+    State(state): State<Arc<Table>>,
     Json(payload): Json<IpRequest>,
-) -> Json<Vec<IpResult>> {
-    let mut results = Vec::new();
+) -> Json<IpResults> {
+    let mut results = IpResults::with_capacity(payload.ips.len());
 
     for ip_str in payload.ips {
         if let Ok(ip) = IpAddr::from_str(&ip_str) {
             if let Some(result) = state.longest_match(&IpNet::from(ip)) {
-                results.push(IpResult {
-                    ip: ip_str,
-                    result: Some(result.1.clone()),
-                });
+                results.insert(ip_str, Some(result.1.clone()));
             } else {
-                results.push(IpResult {
-                    ip: ip_str,
-                    result: None,
-                });
+                results.insert(ip_str, None);
             }
         } else {
-            results.push(IpResult {
-                ip: ip_str,
-                result: None,
-            });
+            results.insert(ip_str, None);
         }
     }
 
@@ -117,13 +82,13 @@ async fn handle_bulk_lookup(
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    assert!(args.len() == 3, "Usage: ./server <asn.csv> <country.csv>");
+    assert!(args.len() == 2, "Usage: ./server <data.csv>");
 
-    let asn_table = load_data(&args[1], &args[2]);
+    let table = load_data(&args[1]);
 
     let app = Router::new()
         .route("/", post(handle_bulk_lookup))
-        .with_state(asn_table.into());
+        .with_state(table.into());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
