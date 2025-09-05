@@ -1,3 +1,4 @@
+use indexmap::IndexSet;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use prost::Message;
@@ -11,24 +12,50 @@ mod protos {
     include!("protos/_.rs");
 }
 
-type Record = (String, String, String, String, String, String, String);
+type Record = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
-type Table = IpnetTrie<protos::IpRecord>;
-
-fn record_convert(record: Record) -> protos::IpRecord {
-    protos::IpRecord {
-        network: record.0,
-        country: record.1,
-        country_code: record.2,
-        continent: record.3,
-        asn: record.4,
-        as_name: record.5,
-        as_domain: record.6,
-    }
+struct IpInfo {
+    network: String,
+    country: usize,
+    asn: usize,
 }
 
-fn load_data(data_path: &str) -> Table {
-    let mut asn_table: Table = IpnetTrie::new();
+type Table = IpnetTrie<IpInfo>;
+
+#[derive(Eq, Hash, PartialEq)]
+struct CountryInfo {
+    country: String,
+    country_code: String,
+    continent: String,
+    continent_code: String,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct ASInfo {
+    asn: String,
+    as_name: String,
+    as_domain: String,
+}
+
+struct IPData {
+    table: Table,
+    countries: IndexSet<CountryInfo>,
+    asns: IndexSet<ASInfo>,
+}
+
+fn load_data(data_path: &str) -> IPData {
+    let mut table: IpnetTrie<IpInfo> = IpnetTrie::new();
+    let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(200);
+    let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(150000);
 
     let mut data_reader = csv::Reader::from_path(data_path).expect("unable to read data");
 
@@ -36,19 +63,77 @@ fn load_data(data_path: &str) -> Table {
         let mut record: Record = result.expect("unable to read record");
 
         if let Ok(network) = IpNet::from_str(&record.0) {
-            asn_table.insert(network, record_convert(record));
+            let (country, _) = countries.insert_full(CountryInfo {
+                country: record.1,
+                country_code: record.2,
+                continent: record.3,
+                continent_code: record.4,
+            });
+            let (asn, _) = asns.insert_full(ASInfo {
+                asn: record.5,
+                as_name: record.6,
+                as_domain: record.7,
+            });
+
+            table.insert(
+                network,
+                IpInfo {
+                    network: record.0,
+                    country,
+                    asn,
+                },
+            );
         } else {
             record.0.push_str("/32");
 
             if let Ok(network) = IpNet::from_str(&record.0) {
-                asn_table.insert(network, record_convert(record));
+                let (country, _) = countries.insert_full(CountryInfo {
+                    country: record.1,
+                    country_code: record.2,
+                    continent: record.3,
+                    continent_code: record.4,
+                });
+                let (asn, _) = asns.insert_full(ASInfo {
+                    asn: record.5,
+                    as_name: record.6,
+                    as_domain: record.7,
+                });
+
+                table.insert(
+                    network,
+                    IpInfo {
+                        network: record.0,
+                        country,
+                        asn,
+                    },
+                );
             } else {
                 panic!("Invalid network {}", record.0)
             }
         }
     }
 
-    asn_table
+    IPData {
+        table,
+        countries,
+        asns,
+    }
+}
+
+fn to_record(ip_data: &IPData, ip_info: &IpInfo) -> Option<protos::IpRecord> {
+    let country_info = ip_data.countries.get_index(ip_info.country)?;
+    let as_info = ip_data.asns.get_index(ip_info.asn)?;
+
+    Some(protos::IpRecord {
+        network: ip_info.network.clone(),
+        country: country_info.country.clone(),
+        country_code: country_info.country_code.clone(),
+        continent: country_info.continent.clone(),
+        continent_code: country_info.continent_code.clone(),
+        asn: as_info.asn.clone(),
+        as_name: as_info.as_name.clone(),
+        as_domain: as_info.as_domain.clone(),
+    })
 }
 
 #[tokio::main]
@@ -56,7 +141,7 @@ async fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 2, "Usage: ./server <data.csv>");
 
-    let table = load_data(&args[1]);
+    let ip_data = load_data(&args[1]);
 
     println!("Data loaded successfully");
 
@@ -76,11 +161,11 @@ async fn main() -> io::Result<()> {
             for ip in request.ips {
                 if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
                     let network = IpNet::from(parsed_ip);
-                    if let Some(found) = table.longest_match(&network) {
+                    if let Some(found) = ip_data.table.longest_match(&network) {
                         response.results.insert(
                             ip,
                             protos::IpResult {
-                                record: Some(found.1.clone()),
+                                record: to_record(&ip_data, found.1),
                             },
                         );
                     } else {
