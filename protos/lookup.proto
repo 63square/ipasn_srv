@@ -18,7 +18,7 @@ message IpRecord {
   string country_code = 3;
   string continent = 4;
   string continent_code = 5;
-  string asn = 6;
+  uint32 asn = 6;
   string as_name = 7;
   string as_domain = 8;
 }
