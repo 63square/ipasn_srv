@@ -203,7 +203,9 @@ impl pb::lookup_server::Lookup for LookupServer {
     type LookupManyStream = Pin<Box<dyn Stream<Item = Result<pb::IpResult, Status>> + Send>>;
 
     async fn lookup_single(&self, req: Request<IpQuery>) -> Result<Response<pb::IpResult>, Status> {
-        let response = if let Ok(parsed_ip) = IpAddr::from_str(&req.into_inner().ip) {
+        let ip = req.into_inner().ip;
+
+        let response = if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
             let network = IpNet::from(parsed_ip);
             if let Some(found) = self.ip_data.table.longest_match(&network) {
                 to_record(&self.ip_data, found.0, *found.1)
@@ -214,7 +216,7 @@ impl pb::lookup_server::Lookup for LookupServer {
             None
         };
 
-        Ok(Response::new(IpResult { response }))
+        Ok(Response::new(IpResult { response, ip }))
     }
 
     async fn lookup_many(
@@ -241,7 +243,7 @@ impl pb::lookup_server::Lookup for LookupServer {
                             None
                         };
 
-                        tx.send(Ok(IpResult { response }))
+                        tx.send(Ok(IpResult { response, ip: v.ip }))
                             .await
                             .expect("working rx");
                     }

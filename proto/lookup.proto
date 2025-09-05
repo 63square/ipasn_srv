@@ -18,7 +18,8 @@ message IpResponse {
 }
 
 message IpResult {
-  optional IpResponse response = 1;
+  string ip = 1;
+  optional IpResponse response = 2;
 }
 
 service Lookup {
