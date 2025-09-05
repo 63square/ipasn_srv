@@ -1,6 +1,5 @@
 fn main() {
-    prost_build::Config::new()
-        .out_dir("src/protos")
-        .compile_protos(&["protos/lookup.proto"], &["protos"])
+    tonic_prost_build::configure()
+        .compile_protos(&["proto/lookup.proto"], &["proto"])
         .unwrap();
 }

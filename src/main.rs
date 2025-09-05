@@ -1,16 +1,22 @@
 use indexmap::IndexSet;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
-use prost::Message;
-use std::collections::HashMap;
 use std::env;
-use std::net::IpAddr;
-use std::ops::Deref;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::str::FromStr;
-use tokio::io;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
+use tonic::transport::Server;
+use tonic::{Request, Status};
+use tonic::{Response, Streaming};
 
-mod protos {
-    include!("protos/_.rs");
+use crate::pb::{IpQuery, IpResult};
+
+mod pb {
+    tonic::include_proto!("grpc.ipasn.lookup");
 }
 
 type Record = (
@@ -169,14 +175,14 @@ fn load_data(data_path: &str) -> IPData {
     }
 }
 
-fn to_record(ip_data: &IPData, network: IpNet, ip_info: IpInfo) -> Option<protos::IpRecord> {
+fn to_record(ip_data: &IPData, network: IpNet, ip_info: IpInfo) -> Option<pb::IpResponse> {
     let (asn, country, continent) = unpack_ip_info(ip_info);
 
     let country_info = ip_data.countries.get_index(country as usize)?;
     let as_info = ip_data.asns.get_index(asn as usize)?;
     let continent_info = ip_data.continents.get_index(continent as usize)?;
 
-    Some(protos::IpRecord {
+    Some(pb::IpResponse {
         network: network.to_string(),
         country: country_info.country.clone(),
         country_code: String::from_utf8(country_info.country_code.to_vec()).unwrap(),
@@ -188,10 +194,76 @@ fn to_record(ip_data: &IPData, network: IpNet, ip_info: IpInfo) -> Option<protos
     })
 }
 
+struct LookupServer {
+    ip_data: Arc<IPData>,
+}
+
+#[tonic::async_trait]
+impl pb::lookup_server::Lookup for LookupServer {
+    type LookupManyStream = Pin<Box<dyn Stream<Item = Result<pb::IpResult, Status>> + Send>>;
+
+    async fn lookup_single(&self, req: Request<IpQuery>) -> Result<Response<pb::IpResult>, Status> {
+        let response = if let Ok(parsed_ip) = IpAddr::from_str(&req.into_inner().ip) {
+            let network = IpNet::from(parsed_ip);
+            if let Some(found) = self.ip_data.table.longest_match(&network) {
+                to_record(&self.ip_data, found.0, *found.1)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Response::new(IpResult { response }))
+    }
+
+    async fn lookup_many(
+        &self,
+        req: tonic::Request<Streaming<IpQuery>>,
+    ) -> Result<Response<Self::LookupManyStream>, Status> {
+        let mut in_stream = req.into_inner();
+        let (tx, rx) = mpsc::channel(128);
+
+        let ip_data = Arc::clone(&self.ip_data);
+
+        tokio::spawn(async move {
+            while let Some(result) = in_stream.next().await {
+                match result {
+                    Ok(v) => {
+                        let response = if let Ok(parsed_ip) = IpAddr::from_str(&v.ip) {
+                            let network = IpNet::from(parsed_ip);
+                            if let Some(found) = ip_data.table.longest_match(&network) {
+                                to_record(&ip_data, found.0, *found.1)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        tx.send(Ok(IpResult { response }))
+                            .await
+                            .expect("working rx");
+                    }
+                    Err(err) => match tx.send(Err(err)).await {
+                        Ok(_) => (),
+                        Err(_err) => break,
+                    },
+                }
+            }
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::LookupManyStream))
+    }
+}
+
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 2, "Usage: ./server <data.csv>");
+
+    println!("Starting...");
 
     let ip_data = load_data(&args[1]);
 
@@ -203,43 +275,15 @@ async fn main() -> io::Result<()> {
         ip_data.asns.len()
     );
 
-    let sock = tokio::net::UdpSocket::bind("127.0.0.1:36841").await?;
-    let mut buf = [0u8; 65535];
+    let server = LookupServer {
+        ip_data: ip_data.into(),
+    };
 
-    println!("Listening for requests");
+    Server::builder()
+        .add_service(pb::lookup_server::LookupServer::new(server))
+        .serve("127.0.0.1:36841".to_socket_addrs().unwrap().next().unwrap())
+        .await
+        .unwrap();
 
-    loop {
-        let (len, addr) = sock.recv_from(&mut buf).await?;
-
-        let mut response: protos::IpLookupResponse = protos::IpLookupResponse {
-            results: HashMap::new(),
-        };
-
-        if let Ok(request) = protos::IpLookupRequest::decode(&buf[..len]) {
-            for ip in request.ips {
-                if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
-                    let network = IpNet::from(parsed_ip);
-                    if let Some(found) = ip_data.table.longest_match(&network) {
-                        response.results.insert(
-                            ip,
-                            protos::IpResult {
-                                record: to_record(&ip_data, found.0, *found.1),
-                            },
-                        );
-                    } else {
-                        response
-                            .results
-                            .insert(ip, protos::IpResult { record: None });
-                    }
-                } else {
-                    response
-                        .results
-                        .insert(ip, protos::IpResult { record: None });
-                }
-            }
-        }
-
-        let response = response.encode_to_vec();
-        let _ = sock.send_to(&response, addr).await?;
-    }
+    Ok(())
 }
