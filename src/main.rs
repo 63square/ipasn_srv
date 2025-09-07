@@ -54,6 +54,7 @@ impl std::hash::Hash for ContinentInfo {
 struct CountryInfo {
     country: String,
     country_code: [u8; 2],
+    continent: u8,
 }
 
 impl std::hash::Hash for CountryInfo {
@@ -83,30 +84,26 @@ struct IPData {
     ip_data: IndexSet<u32>,
 }
 
-const CONTINENT_BITS: u32 = 4;
-const COUNTRY_BITS: u32 = 8;
-const ASN_SHIFT: u32 = CONTINENT_BITS + COUNTRY_BITS;
+const ASN_SHIFT: u32 = 8;
 
-fn pack_ip_info(asn: u32, country: u8, continent: u8) -> u32 {
-    (asn << (COUNTRY_BITS + CONTINENT_BITS))
-        | ((country as u32) << CONTINENT_BITS)
-        | (continent as u32)
+fn pack_ip_info(asn: u32, country: u8) -> u32 {
+    (asn << ASN_SHIFT) | country as u32
 }
 
-fn unpack_ip_info(code: u32) -> (u32, u8, u8) {
-    let continent = (code & 0xF) as u8;
-    let country = ((code >> CONTINENT_BITS) & 0xFF) as u8;
+fn unpack_ip_info(code: u32) -> (u32, u8) {
+    let country = (code & 0xFF) as u8;
     let asn = code >> ASN_SHIFT;
 
-    (asn, country, continent)
+    (asn, country)
 }
 
 fn load_data(data_path: &str) -> IPData {
     let mut table: Table = IpnetTrie::new();
-    let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(8);
-    let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(255);
-    let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(150000);
-    let mut ip_data: IndexSet<u32> = IndexSet::new();
+
+    let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(7);
+    let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(246);
+    let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(72840);
+    let mut ip_data: IndexSet<u32> = IndexSet::with_capacity(105346);
 
     let file = File::open(Path::new(data_path)).expect("unable to read file");
 
@@ -168,15 +165,25 @@ fn load_data(data_path: &str) -> IPData {
             let record_continent = continent_array.value(i);
             let record_continent_code = continent_code_array.value(i);
 
-            let (continent, _) = continents.insert_full(ContinentInfo {
-                continent: record_continent.to_owned(),
-                continent_code: record_continent_code.as_bytes().try_into().unwrap(),
-            });
-
-            let (country, _) = countries.insert_full(CountryInfo {
+            let mut country_info = CountryInfo {
                 country: record_country.to_owned(),
                 country_code: record_country_code.as_bytes().try_into().unwrap(),
-            });
+                continent: 0,
+            };
+
+            let country = if let Some((country_index, _)) = countries.get_full(&country_info) {
+                country_index
+            } else {
+                let (continent, _) = continents.insert_full(ContinentInfo {
+                    continent: record_continent.to_owned(),
+                    continent_code: record_continent_code.as_bytes().try_into().unwrap(),
+                });
+
+                country_info.continent = continent as u8;
+
+                let (country_index, _) = countries.insert_full(country_info);
+                country_index
+            };
 
             let as_info = if !asn_array.is_null(i) {
                 let record_asn = asn_array.value(i);
@@ -202,12 +209,7 @@ fn load_data(data_path: &str) -> IPData {
 
             let (asn, _) = asns.insert_full(as_info);
 
-            let ip_info = pack_ip_info(
-                asn.try_into().unwrap(),
-                country.try_into().unwrap(),
-                continent.try_into().unwrap(),
-            );
-
+            let ip_info = pack_ip_info(asn.try_into().unwrap(), country.try_into().unwrap());
             let (ip_index, _) = ip_data.insert_full(ip_info);
 
             if let Ok(network) = IpNet::from_str(record_network) {
@@ -239,7 +241,7 @@ fn load_data(data_path: &str) -> IPData {
 fn to_record(ip_data: &IPData, network: IpNet, ip_info: &U24) -> Option<pb::IpResponse> {
     let ip_index: u32 = ip_info.read();
 
-    let (asn, country, continent) = unpack_ip_info(
+    let (asn, country) = unpack_ip_info(
         *ip_data
             .ip_data
             .get_index(ip_index.try_into().unwrap())
@@ -248,7 +250,9 @@ fn to_record(ip_data: &IPData, network: IpNet, ip_info: &U24) -> Option<pb::IpRe
 
     let country_info = ip_data.countries.get_index(country as usize)?;
     let as_info = ip_data.asns.get_index(asn as usize)?;
-    let continent_info = ip_data.continents.get_index(continent as usize)?;
+    let continent_info = ip_data
+        .continents
+        .get_index(country_info.continent as usize)?;
 
     Some(pb::IpResponse {
         network: network.to_string(),
