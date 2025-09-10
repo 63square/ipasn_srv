@@ -851,13 +851,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip_network_table-deps-treebitmap"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e537132deb99c0eb4b752f0346b6a836200eaaa3516dd7e5514b63930a09e5d"
+
+[[package]]
 name = "ipasn_srv"
 version = "0.1.0"
 dependencies = [
  "arrow",
  "indexmap",
+ "ip_network_table-deps-treebitmap",
  "ipnet",
- "ipnet-trie",
  "parquet",
  "prost",
  "serde",
@@ -873,16 +879,6 @@ name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
-
-[[package]]
-name = "ipnet-trie"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfa31eccd160220ed5765820b282754ec7e9b36a8f6ea65e08fc0c31c9058cc"
-dependencies = [
- "ipnet",
- "prefix-trie",
-]
 
 [[package]]
 name = "itertools"
@@ -1259,16 +1255,6 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
-
-[[package]]
-name = "prefix-trie"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb5f930995ba4986bd239ba8d8fded67cad82d1db329c4f316f312847cba16aa"
-dependencies = [
- "ipnet",
- "num-traits",
-]
 
 [[package]]
 name = "prettyplease"

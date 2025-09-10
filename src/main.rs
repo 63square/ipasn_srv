@@ -1,11 +1,11 @@
 use arrow::array::{Array, StringArray};
 use indexmap::IndexSet;
+use ip_network_table_deps_treebitmap::IpLookupTable;
 use ipnet::IpNet;
-use ipnet_trie::IpnetTrie;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::env;
 use std::fs::File;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -36,7 +36,55 @@ impl U24 {
     }
 }
 
-type Table = IpnetTrie<U24>;
+struct IPTable {
+    ipv4_table: IpLookupTable<Ipv4Addr, U24>,
+    ipv6_table: IpLookupTable<Ipv6Addr, U24>,
+}
+
+impl IPTable {
+    pub fn new() -> Self {
+        Self {
+            ipv4_table: IpLookupTable::new(),
+            ipv6_table: IpLookupTable::new(),
+        }
+    }
+
+    pub fn insert(&mut self, network: &IpNet, value: U24) {
+        match network {
+            IpNet::V4(net) => self
+                .ipv4_table
+                .insert(net.network(), net.prefix_len().into(), value),
+            IpNet::V6(net) => self
+                .ipv6_table
+                .insert(net.network(), net.prefix_len().into(), value),
+        };
+    }
+
+    pub fn get(&self, ip: &IpAddr) -> Option<(IpNet, &U24)> {
+        match ip {
+            IpAddr::V4(addr) => {
+                if let Some((found_addr, prefix, value)) = self.ipv4_table.longest_match(*addr) {
+                    Some((
+                        IpNet::new(IpAddr::V4(found_addr), prefix as u8).unwrap(),
+                        value,
+                    ))
+                } else {
+                    None
+                }
+            }
+            IpAddr::V6(addr) => {
+                if let Some((found_addr, prefix, value)) = self.ipv6_table.longest_match(*addr) {
+                    Some((
+                        IpNet::new(IpAddr::V6(found_addr), prefix as u8).unwrap(),
+                        value,
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
 
 #[derive(Eq, PartialEq)]
 struct ContinentInfo {
@@ -77,7 +125,7 @@ impl std::hash::Hash for ASInfo {
 }
 
 struct IPData {
-    table: Table,
+    table: IPTable,
     continents: IndexSet<ContinentInfo>,
     countries: IndexSet<CountryInfo>,
     asns: IndexSet<ASInfo>,
@@ -98,7 +146,7 @@ fn unpack_ip_info(code: u32) -> (u32, u8) {
 }
 
 fn load_data(data_path: &str) -> IPData {
-    let mut table: Table = IpnetTrie::new();
+    let mut table = IPTable::new();
 
     let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(7);
     let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(246);
@@ -213,13 +261,13 @@ fn load_data(data_path: &str) -> IPData {
             let (ip_index, _) = ip_data.insert_full(ip_info);
 
             if let Ok(network) = IpNet::from_str(record_network) {
-                table.insert(network, U24::new(ip_index as u32));
+                table.insert(&network, U24::new(ip_index as u32));
             } else {
                 let mut network_clone = record_network.to_string();
                 network_clone.push_str("/32");
 
                 if let Ok(network) = IpNet::from_str(&network_clone) {
-                    table.insert(network, U24::new(ip_index as u32));
+                    table.insert(&network, U24::new(ip_index as u32));
                 } else {
                     panic!("Invalid network {}", record_network)
                 }
@@ -278,8 +326,7 @@ impl pb::lookup_server::Lookup for LookupServer {
         let ip = req.into_inner().ip;
 
         let response = if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
-            let network = IpNet::from(parsed_ip);
-            if let Some(found) = self.ip_data.table.longest_match(&network) {
+            if let Some(found) = self.ip_data.table.get(&parsed_ip) {
                 to_record(&self.ip_data, found.0, found.1)
             } else {
                 None
@@ -305,8 +352,7 @@ impl pb::lookup_server::Lookup for LookupServer {
                 match result {
                     Ok(v) => {
                         let response = if let Ok(parsed_ip) = IpAddr::from_str(&v.ip) {
-                            let network = IpNet::from(parsed_ip);
-                            if let Some(found) = ip_data.table.longest_match(&network) {
+                            if let Some(found) = ip_data.table.get(&parsed_ip) {
                                 to_record(&ip_data, found.0, found.1)
                             } else {
                                 None

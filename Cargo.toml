@@ -6,8 +6,8 @@ edition = "2024"
 [dependencies]
 arrow = "56.1.0"
 indexmap = "2.11.0"
+ip_network_table-deps-treebitmap = "0.5.0"
 ipnet = "2.11.0"
-ipnet-trie = "0.3.0"
 parquet = "56.1.0"
 prost = "0.14.1"
 serde = { version = "1.0.219", features = ["serde_derive"] }
