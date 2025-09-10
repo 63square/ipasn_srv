@@ -2,6 +2,7 @@ use flate2::read::GzDecoder;
 use indexmap::IndexSet;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use ipnet::IpNet;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -116,6 +117,7 @@ struct ASInfo {
     asn: u32,
     as_name: String,
     as_domain: String,
+    tags: Vec<String>,
 }
 
 impl std::hash::Hash for ASInfo {
@@ -157,14 +159,29 @@ struct Record {
     as_domain: Option<String>,
 }
 
-fn load_data(data_path: &str) -> IPData {
+fn load_data(data_path: &str, tags_path: &str) -> IPData {
     let mut table = IPTable::with_capacity(1500000, 4500000);
     let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(7);
     let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(250);
     let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(80000);
     let mut ip_data: IndexSet<u32> = IndexSet::with_capacity(150000);
 
-    let file = File::open(Path::new(data_path)).expect("unable to read file");
+    let mut asn_to_tags: HashMap<u32, Vec<String>> = HashMap::new();
+    let tags_file: File = File::open(Path::new(tags_path)).expect("unable to read tags file");
+    let tags_data: HashMap<String, Vec<u32>> =
+        serde_json::from_reader(tags_file).expect("unable to parse tags json");
+
+    for (tag, asns) in tags_data {
+        for asn in asns {
+            if let Some(tags) = asn_to_tags.get_mut(&asn) {
+                tags.push(tag.clone());
+            } else {
+                asn_to_tags.insert(asn, vec![tag.clone()]);
+            }
+        }
+    }
+
+    let file = File::open(Path::new(data_path)).expect("unable to read data file");
 
     let gz_decoder = GzDecoder::new(file);
     let reader = BufReader::new(gz_decoder);
@@ -196,20 +213,24 @@ fn load_data(data_path: &str) -> IPData {
         let as_info = if let (Some(asn), Some(as_name), Some(as_domain)) =
             (record.asn, record.as_name, record.as_domain)
         {
+            let asn = if asn.len() > 2 {
+                asn[2..].parse().expect("Invalid AS number")
+            } else {
+                panic!("Invalid AS: {}", asn);
+            };
+
             ASInfo {
-                asn: if asn.len() > 2 {
-                    asn[2..].parse().expect("Invalid AS number")
-                } else {
-                    panic!("Invalid AS: {}", asn);
-                },
+                asn,
                 as_name,
                 as_domain,
+                tags: asn_to_tags.get(&asn).unwrap_or(&Vec::new()).to_vec(),
             }
         } else {
             ASInfo {
                 asn: 0,
                 as_name: String::new(),
                 as_domain: String::new(),
+                tags: Vec::new(),
             }
         };
 
@@ -268,6 +289,7 @@ fn to_record(ip_data: &IPData, network: IpNet, ip_info: &U24) -> Option<pb::IpRe
         asn: as_info.asn.clone(),
         as_name: as_info.as_name.clone(),
         as_domain: as_info.as_domain.clone(),
+        tags: as_info.tags.clone(),
     })
 }
 
@@ -338,11 +360,11 @@ impl pb::lookup_server::Lookup for LookupServer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    assert!(args.len() == 2, "Usage: ./server <data.csv.gz>");
+    assert!(args.len() == 3, "Usage: ./server <data.csv.gz> <tags.json>");
 
     println!("Starting...");
 
-    let ip_data = load_data(&args[1]);
+    let ip_data = load_data(&args[1], &args[2]);
 
     println!("Data loaded successfully");
     println!(

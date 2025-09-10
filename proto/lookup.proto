@@ -15,6 +15,7 @@ message IpResponse {
   uint32 asn = 6;
   string as_name = 7;
   string as_domain = 8;
+  repeated string tags = 9; 
 }
 
 message IpResult {
