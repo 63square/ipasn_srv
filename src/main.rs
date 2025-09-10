@@ -380,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(pb::lookup_server::LookupServer::new(server))
-        .serve("127.0.0.1:36841".to_socket_addrs().unwrap().next().unwrap())
+        .serve("0.0.0.0:36841".to_socket_addrs().unwrap().next().unwrap())
         .await
         .unwrap();
 
