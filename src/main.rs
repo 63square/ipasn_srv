@@ -1,10 +1,10 @@
-use arrow::array::{Array, StringArray};
+use flate2::read::GzDecoder;
 use indexmap::IndexSet;
 use ip_network_table_deps_treebitmap::IpLookupTable;
 use ipnet::IpNet;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::env;
 use std::fs::File;
+use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
 use std::pin::Pin;
@@ -42,10 +42,10 @@ struct IPTable {
 }
 
 impl IPTable {
-    pub fn new() -> Self {
+    pub fn with_capacity(ipv4_capacity: usize, ipv6_capacity: usize) -> Self {
         Self {
-            ipv4_table: IpLookupTable::new(),
-            ipv6_table: IpLookupTable::new(),
+            ipv4_table: IpLookupTable::with_capacity(ipv4_capacity),
+            ipv6_table: IpLookupTable::with_capacity(ipv6_capacity),
         }
     }
 
@@ -145,132 +145,89 @@ fn unpack_ip_info(code: u32) -> (u32, u8) {
     (asn, country)
 }
 
-fn load_data(data_path: &str) -> IPData {
-    let mut table = IPTable::new();
+#[derive(Debug, serde::Deserialize)]
+struct Record {
+    network: String,
+    country: String,
+    country_code: String,
+    continent: String,
+    continent_code: String,
+    asn: Option<String>,
+    as_name: Option<String>,
+    as_domain: Option<String>,
+}
 
+fn load_data(data_path: &str) -> IPData {
+    let mut table = IPTable::with_capacity(1500000, 4500000);
     let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(7);
-    let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(246);
-    let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(72840);
-    let mut ip_data: IndexSet<u32> = IndexSet::with_capacity(105346);
+    let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(250);
+    let mut asns: IndexSet<ASInfo> = IndexSet::with_capacity(80000);
+    let mut ip_data: IndexSet<u32> = IndexSet::with_capacity(150000);
 
     let file = File::open(Path::new(data_path)).expect("unable to read file");
 
-    let mut arrow_reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("unable to read parquet")
-        .build()
-        .unwrap();
+    let gz_decoder = GzDecoder::new(file);
+    let reader = BufReader::new(gz_decoder);
 
-    while let Some(batch) = arrow_reader.next() {
-        let batch = batch.unwrap();
+    let mut rdr = csv::Reader::from_reader(reader);
+    for result in rdr.deserialize() {
+        let record: Record = result.expect("unable to parse record");
 
-        let network_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let country_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let country_code_array = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let continent_array = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let continent_code_array = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let asn_array = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let as_name_array = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let as_domain_array = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let mut country_info = CountryInfo {
+            country: record.country,
+            country_code: record.country_code.as_bytes().try_into().unwrap(),
+            continent: 0,
+        };
 
-        for i in 0..batch.num_rows() {
-            let record_network = network_array.value(i);
+        let country = if let Some((country_index, _)) = countries.get_full(&country_info) {
+            country_index
+        } else {
+            let (continent, _) = continents.insert_full(ContinentInfo {
+                continent: record.continent,
+                continent_code: record.continent_code.as_bytes().try_into().unwrap(),
+            });
 
-            let record_country = country_array.value(i);
-            let record_country_code = country_code_array.value(i);
+            country_info.continent = continent as u8;
 
-            let record_continent = continent_array.value(i);
-            let record_continent_code = continent_code_array.value(i);
+            let (country_index, _) = countries.insert_full(country_info);
+            country_index
+        };
 
-            let mut country_info = CountryInfo {
-                country: record_country.to_owned(),
-                country_code: record_country_code.as_bytes().try_into().unwrap(),
-                continent: 0,
-            };
+        let as_info = if let (Some(asn), Some(as_name), Some(as_domain)) =
+            (record.asn, record.as_name, record.as_domain)
+        {
+            ASInfo {
+                asn: if asn.len() > 2 {
+                    asn[2..].parse().expect("Invalid AS number")
+                } else {
+                    panic!("Invalid AS: {}", asn);
+                },
+                as_name,
+                as_domain,
+            }
+        } else {
+            ASInfo {
+                asn: 0,
+                as_name: String::new(),
+                as_domain: String::new(),
+            }
+        };
 
-            let country = if let Some((country_index, _)) = countries.get_full(&country_info) {
-                country_index
-            } else {
-                let (continent, _) = continents.insert_full(ContinentInfo {
-                    continent: record_continent.to_owned(),
-                    continent_code: record_continent_code.as_bytes().try_into().unwrap(),
-                });
+        let (asn, _) = asns.insert_full(as_info);
 
-                country_info.continent = continent as u8;
+        let ip_info = pack_ip_info(asn.try_into().unwrap(), country.try_into().unwrap());
+        let (ip_index, _) = ip_data.insert_full(ip_info);
 
-                let (country_index, _) = countries.insert_full(country_info);
-                country_index
-            };
+        if let Ok(network) = IpNet::from_str(&record.network) {
+            table.insert(&network, U24::new(ip_index as u32));
+        } else {
+            let mut network_clone = record.network.clone();
+            network_clone.push_str("/32");
 
-            let as_info = if !asn_array.is_null(i) {
-                let record_asn = asn_array.value(i);
-                let record_as_name = as_name_array.value(i);
-                let record_as_domain = as_domain_array.value(i);
-
-                ASInfo {
-                    asn: if record_asn.len() > 2 {
-                        record_asn.parse().unwrap_or(0)
-                    } else {
-                        0
-                    },
-                    as_name: record_as_name.to_owned(),
-                    as_domain: record_as_domain.to_owned(),
-                }
-            } else {
-                ASInfo {
-                    asn: 0,
-                    as_name: String::new(),
-                    as_domain: String::new(),
-                }
-            };
-
-            let (asn, _) = asns.insert_full(as_info);
-
-            let ip_info = pack_ip_info(asn.try_into().unwrap(), country.try_into().unwrap());
-            let (ip_index, _) = ip_data.insert_full(ip_info);
-
-            if let Ok(network) = IpNet::from_str(record_network) {
+            if let Ok(network) = IpNet::from_str(&network_clone) {
                 table.insert(&network, U24::new(ip_index as u32));
             } else {
-                let mut network_clone = record_network.to_string();
-                network_clone.push_str("/32");
-
-                if let Ok(network) = IpNet::from_str(&network_clone) {
-                    table.insert(&network, U24::new(ip_index as u32));
-                } else {
-                    panic!("Invalid network {}", record_network)
-                }
+                panic!("Invalid network {}", &record.network)
             }
         }
     }
@@ -381,7 +338,7 @@ impl pb::lookup_server::Lookup for LookupServer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    assert!(args.len() == 2, "Usage: ./server <data.parquet>");
+    assert!(args.len() == 2, "Usage: ./server <data.csv.gz>");
 
     println!("Starting...");
 

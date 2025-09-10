@@ -1,4 +1,4 @@
 /target
 /src/proto
 
-ipinfo_lite.parquet
+ipinfo_lite.csv.gz
