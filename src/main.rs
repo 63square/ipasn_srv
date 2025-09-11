@@ -117,7 +117,7 @@ struct ASInfo {
     asn: u32,
     as_name: String,
     as_domain: String,
-    tags: Vec<String>,
+    as_tags: Vec<String>,
 }
 
 impl std::hash::Hash for ASInfo {
@@ -222,14 +222,14 @@ fn load_data(data_path: &str, tags_path: &str) -> Result<IPData, Box<dyn std::er
                 asn,
                 as_name,
                 as_domain,
-                tags: asn_to_tags.get(&asn).unwrap_or(&Vec::new()).to_vec(),
+                as_tags: asn_to_tags.get(&asn).unwrap_or(&Vec::new()).to_vec(),
             }
         } else {
             ASInfo {
                 asn: 0,
                 as_name: String::new(),
                 as_domain: String::new(),
-                tags: Vec::new(),
+                as_tags: Vec::new(),
             }
         };
 
@@ -294,7 +294,7 @@ fn to_record(ip_data: &IPData, network: IpNet, ip_info: &U24) -> Option<pb::IpRe
         asn: as_info.asn.clone(),
         as_name: as_info.as_name.clone(),
         as_domain: as_info.as_domain.clone(),
-        tags: as_info.tags.clone(),
+        as_tags: as_info.as_tags.clone(),
     })
 }
 
@@ -386,6 +386,8 @@ impl pb::lookup_server::Lookup for LookupServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bind_addr = std::env::var("BIND").unwrap_or("0.0.0.0:36841".to_string());
+
     let args: Vec<String> = env::args().collect();
     assert!(args.len() == 3, "Usage: ./server <data.csv.gz> <tags.json>");
 
@@ -401,7 +403,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(pb::lookup_server::LookupServer::new(server))
-        .serve("0.0.0.0:36841".to_socket_addrs().unwrap().next().unwrap())
+        .serve(bind_addr.to_socket_addrs().unwrap().next().unwrap())
         .await
         .unwrap();
 
