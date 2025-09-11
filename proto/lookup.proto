@@ -21,6 +21,8 @@ message IpResponse {
 message IpResult {
   string ip = 1;
   optional IpResponse response = 2;
+  bool invalid = 3;
+  bool bogon = 4;
 }
 
 service Lookup {

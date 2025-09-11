@@ -159,7 +159,7 @@ struct Record {
     as_domain: Option<String>,
 }
 
-fn load_data(data_path: &str, tags_path: &str) -> IPData {
+fn load_data(data_path: &str, tags_path: &str) -> Result<IPData, Box<dyn std::error::Error>> {
     let mut table = IPTable::with_capacity(1500000, 4500000);
     let mut continents: IndexSet<ContinentInfo> = IndexSet::with_capacity(7);
     let mut countries: IndexSet<CountryInfo> = IndexSet::with_capacity(250);
@@ -167,9 +167,8 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
     let mut ip_data: IndexSet<u32> = IndexSet::with_capacity(150000);
 
     let mut asn_to_tags: HashMap<u32, Vec<String>> = HashMap::new();
-    let tags_file: File = File::open(Path::new(tags_path)).expect("unable to read tags file");
-    let tags_data: HashMap<String, Vec<u32>> =
-        serde_json::from_reader(tags_file).expect("unable to parse tags json");
+    let tags_file: File = File::open(Path::new(tags_path))?;
+    let tags_data: HashMap<String, Vec<u32>> = serde_json::from_reader(tags_file)?;
 
     for (tag, asns) in tags_data {
         for asn in asns {
@@ -181,18 +180,18 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
         }
     }
 
-    let file = File::open(Path::new(data_path)).expect("unable to read data file");
+    let file = File::open(Path::new(data_path))?;
 
     let gz_decoder = GzDecoder::new(file);
     let reader = BufReader::new(gz_decoder);
 
     let mut rdr = csv::Reader::from_reader(reader);
     for result in rdr.deserialize() {
-        let record: Record = result.expect("unable to parse record");
+        let record: Record = result?;
 
         let mut country_info = CountryInfo {
             country: record.country,
-            country_code: record.country_code.as_bytes().try_into().unwrap(),
+            country_code: record.country_code.as_bytes().try_into()?,
             continent: 0,
         };
 
@@ -201,7 +200,7 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
         } else {
             let (continent, _) = continents.insert_full(ContinentInfo {
                 continent: record.continent,
-                continent_code: record.continent_code.as_bytes().try_into().unwrap(),
+                continent_code: record.continent_code.as_bytes().try_into()?,
             });
 
             country_info.continent = continent as u8;
@@ -214,9 +213,9 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
             (record.asn, record.as_name, record.as_domain)
         {
             let asn = if asn.len() > 2 {
-                asn[2..].parse().expect("Invalid AS number")
+                asn[2..].parse()?
             } else {
-                panic!("Invalid AS: {}", asn);
+                return Err("invalid AS in data".into());
             };
 
             ASInfo {
@@ -236,7 +235,7 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
 
         let (asn, _) = asns.insert_full(as_info);
 
-        let ip_info = pack_ip_info(asn.try_into().unwrap(), country.try_into().unwrap());
+        let ip_info = pack_ip_info(asn.try_into()?, country.try_into()?);
         let (ip_index, _) = ip_data.insert_full(ip_info);
 
         if let Ok(network) = IpNet::from_str(&record.network) {
@@ -248,20 +247,26 @@ fn load_data(data_path: &str, tags_path: &str) -> IPData {
             if let Ok(network) = IpNet::from_str(&network_clone) {
                 table.insert(&network, U24::new(ip_index as u32));
             } else {
-                panic!("Invalid network {}", &record.network)
+                return Err("invalid network in data".into());
             }
         }
     }
 
-    println!("{} unique entries", ip_data.len());
+    println!(
+        "Continents: {} | Countries: {} | ASNs: {} | Unique entries: {}",
+        continents.len(),
+        countries.len(),
+        asns.len(),
+        ip_data.len(),
+    );
 
-    IPData {
+    Ok(IPData {
         table,
         continents,
         countries,
         asns,
         ip_data,
-    }
+    })
 }
 
 fn to_record(ip_data: &IPData, network: IpNet, ip_info: &U24) -> Option<pb::IpResponse> {
@@ -304,17 +309,28 @@ impl pb::lookup_server::Lookup for LookupServer {
     async fn lookup_single(&self, req: Request<IpQuery>) -> Result<Response<pb::IpResult>, Status> {
         let ip = req.into_inner().ip;
 
+        let mut invalid = false;
+        let mut bogon = false;
+
         let response = if let Ok(parsed_ip) = IpAddr::from_str(&ip) {
             if let Some(found) = self.ip_data.table.get(&parsed_ip) {
                 to_record(&self.ip_data, found.0, found.1)
             } else {
+                bogon = true;
                 None
             }
         } else {
+            invalid = true;
+            bogon = true;
             None
         };
 
-        Ok(Response::new(IpResult { response, ip }))
+        Ok(Response::new(IpResult {
+            response,
+            ip,
+            invalid,
+            bogon,
+        }))
     }
 
     async fn lookup_many(
@@ -330,19 +346,30 @@ impl pb::lookup_server::Lookup for LookupServer {
             while let Some(result) = in_stream.next().await {
                 match result {
                     Ok(v) => {
+                        let mut invalid = false;
+                        let mut bogon = false;
+
                         let response = if let Ok(parsed_ip) = IpAddr::from_str(&v.ip) {
                             if let Some(found) = ip_data.table.get(&parsed_ip) {
                                 to_record(&ip_data, found.0, found.1)
                             } else {
+                                bogon = true;
                                 None
                             }
                         } else {
+                            invalid = true;
+                            bogon = true;
                             None
                         };
 
-                        tx.send(Ok(IpResult { response, ip: v.ip }))
-                            .await
-                            .expect("working rx");
+                        tx.send(Ok(IpResult {
+                            response,
+                            ip: v.ip,
+                            invalid,
+                            bogon,
+                        }))
+                        .await
+                        .expect("working rx");
                     }
                     Err(err) => match tx.send(Err(err)).await {
                         Ok(_) => (),
@@ -364,15 +391,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting...");
 
-    let ip_data = load_data(&args[1], &args[2]);
+    let ip_data = load_data(&args[1], &args[2]).expect("failed to load data");
 
     println!("Data loaded successfully");
-    println!(
-        "Continents: {} | Countries: {} | ASNs: {}",
-        ip_data.continents.len(),
-        ip_data.countries.len(),
-        ip_data.asns.len()
-    );
 
     let server = LookupServer {
         ip_data: ip_data.into(),

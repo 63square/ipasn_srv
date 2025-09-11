@@ -1,6 +1,6 @@
 # IP ASN Server
 
-Simple HTTP/1.1 server for IP ASN and country code lookup.
+Simple gRPC server for IP ASN and country code lookup.
 
 `Usage: ./server <data.csv.gz> <tags.json>`
 
